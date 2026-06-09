@@ -140,6 +140,66 @@ higher-distortion types receive lower deductibles (more coverage).
 
 ---
 
+### Direct 2D Formulation — A Critical Validation
+
+The 1D path parameterization forces the deductible to be a smooth function of a
+single index $t$. To check whether the 1D result is an artifact of this
+parameterization, we also solve the problem **directly on the 2D type rectangle**
+— optimizing the deductible matrix $D_{ij}$ with pointwise separable surplus
+$\Phi(\theta,\varphi,d)$ and 2D monotonicity constraints.
+
+**Mathematical structure.** The 2D virtual surplus is:
+
+$$
+\Phi(\theta,\varphi,d) = V - \mathbb{E}[I] - V_\theta\cdot(2-\theta) - V_\varphi\cdot(2-\varphi)
+$$
+
+with closed-form expressions for $V, \mathbb{E}[I], V_\theta, V_\varphi$.
+Unlike the 1D formulation, **no derivative $h'$ appears** — $\Phi$ depends on $d$ pointwise.  
+The optimization problem is:
+
+$$
+\max_{D_{ij}} \sum_{i,j} \Phi(\theta_i, \varphi_j, D_{ij})
+\quad\text{s.t.}\quad
+0 \le D_{ij} \le 10,\;
+D_{i+1,j} \le D_{ij},\;
+D_{i,j+1} \le D_{ij}
+$$
+
+This is a separable concave maximization under a product partial order
+(2D isotonic optimization). It is solved via SLSQP on a $20\times 20$ grid
+(441 variables, 840 linear inequality constraints).
+
+#### ⚠️ Key Finding: 1D and 2D Formulations Disagree
+
+| | 1D Path $h^*(t)$ | 2D Direct $D^*(\theta,\varphi)$ |
+|---|---|---|
+| Deductible range | $[0, 0.95]$ | $[0, 10]$ |
+| Diagonal values | $h \approx 0.95$ flat, then drops | $D = 10$ until $\theta \approx 1.8$, then drops to $0$ |
+| $L_{\text{bar}}$ binding? | **No** (stays well below 10) | **Yes** (saturates at 10 for most types) |
+| Solution structure | Smooth, near-constant | Binary/step-function |
+
+The **$L^2$ distance between the two diagonals is ≈ 9.1** — they are
+essentially different solutions.
+
+![1D vs 2D comparison](figures/1d_vs_2d_comparison.png)
+
+**Interpretation.** In the 2D direct formulation (no $h'$ penalty), the
+insurer would prefer to offer either **full coverage ($d=0$)** or **no
+coverage ($d=10$)** — a corner solution. The 1D path formulation's $h'$
+terms act as a powerful regularizer, forcing a smooth interior solution.
+This discrepancy raises a **fundamental question about the equivalence**
+of the diagonal reduction in Zhang & Cheung's derivation.
+
+The 2D solver is in `canonical_2d/`:
+```python
+from canonical_2d.solve_2d import solve_2d, solve_pointwise
+res = solve_2d(N_theta=20, N_phi=20)      # full constrained
+theta, phi, D_pw, Phi_pw = solve_pointwise()  # unconstrained diagnostic
+```
+
+---
+
 ## Quick Start
 
 ```python
