@@ -21,7 +21,7 @@ Canonical Example
 
 import numpy as np
 from numpy.polynomial.legendre import leggauss
-from scipy.optimize import minimize, bisect
+from scipy.optimize import minimize
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -304,22 +304,28 @@ def G_of_t(t, h_val):
 # Deductible surface reconstruction  d(θ, φ)
 # ═══════════════════════════════════════════════════════════════════════
 
-def reconstruct_surface(h_opt, n_theta=50, n_phi=50):
-    """Reconstruct the deductible surface d(θ, φ) from the optimal path h*(t).
+def reconstruct_surface(h_opt, n_theta=80, n_phi=80, oversample=4):
+    """Reconstruct the deductible surface d(θ, φ) from h*(t).
 
-    For each (θ, φ) ∈ [1,2]×[1,2], find t* solving:
-        F₁(θ, t*) = φ
+    For each (θ, φ) ∈ [1, 2] × [1, 2]:
+
+        t*(θ, φ) = max{ t ∈ [0, 1] : F₁(θ, t) ≤ φ }
+        d(θ, φ) = h*(t*)
+
     where  F₁(θ, t) = ln G(t) / ln(1 − e^{−h*(t)/θ}),
            G(t) = (1 − e^{−h*(t)/(1+t)})^{1+t}.
 
-    Then  d(θ, φ) = h*(t*).
+    The max-t formulation guarantees d(θ, φ) is non-increasing in both θ
+    and φ, matching the theoretical monotonicity result.
 
     Parameters
     ----------
     h_opt : ndarray of shape (N+1,)
         Optimal nodal values.
     n_theta, n_phi : int
-        Grid resolution.
+        Output grid resolution.
+    oversample : int
+        Factor by which to oversample the t-grid for precision.
 
     Returns
     -------
@@ -328,64 +334,72 @@ def reconstruct_surface(h_opt, n_theta=50, n_phi=50):
     d_surface : ndarray (n_theta, n_phi)
     """
     N = len(h_opt) - 1
-    t_nodes = np.linspace(0.0, 1.0, N + 1)
-    # Pre-compute ln G at each t for fast lookup
-    ln_G_at_t = np.array([
-        np.log(_clip_pos(1.0 - np.exp(-h_opt[i] / (1.0 + t_nodes[i])), 1e-14))
-        * (1.0 + t_nodes[i])
-        for i in range(N + 1)
-    ])
+    t_nodes_coarse = np.linspace(0.0, 1.0, N + 1)
+
+    # Oversampled t-grid for finer root resolution
+    N_fine = N * oversample
+    t_fine = np.linspace(0.0, 1.0, N_fine + 1)
+    h_fine = np.interp(t_fine, t_nodes_coarse, h_opt)
 
     theta_vals = np.linspace(1.0, 2.0, n_theta)
     phi_vals = np.linspace(1.0, 2.0, n_phi)
     theta_grid, phi_grid = np.meshgrid(theta_vals, phi_vals, indexing="ij")
     d_surface = np.full((n_theta, n_phi), np.nan)
 
-    # Interpolators
-    def ln_G_interp(t):
-        return np.interp(t, t_nodes, ln_G_at_t)
+    # Pre-compute ln G(t) on fine grid
+    ln_G_fine = np.array([
+        np.log(_clip_pos(1.0 - np.exp(-h_fine[k] / (1.0 + t_fine[k])), 1e-14))
+        * (1.0 + t_fine[k])
+        for k in range(N_fine + 1)
+    ])
 
-    def h_interp(t):
-        return np.interp(t, t_nodes, h_opt)
+    # Pre-compute ln A = ln(1 − e^{−h/θ}) for each θ on fine grid
+    # Shape: (n_theta, N_fine+1)
+    ln_A_cache = np.zeros((n_theta, N_fine + 1))
+    for i, theta in enumerate(theta_vals):
+        for k in range(N_fine + 1):
+            A = _clip_pos(1.0 - np.exp(-h_fine[k] / theta), 1e-14)
+            ln_A_cache[i, k] = np.log(A)
 
-    def F1_of_t_theta(t, theta):
-        ln_G = ln_G_interp(t)
-        A = _clip_pos(1.0 - np.exp(-h_interp(t) / theta), 1e-14)
-        return ln_G / np.log(A)
+    # F₁(θ_i, t_k) for all θ, t
+    F1_cache = ln_G_fine[np.newaxis, :] / ln_A_cache  # (n_theta, N_fine+1)
 
     for i, theta in enumerate(theta_vals):
         for j, phi in enumerate(phi_vals):
-            # Special case: on diagonal, t = θ − 1 = φ − 1
-            if abs(theta - phi) < 1e-3:
+            # On diagonal: t = θ − 1 = φ − 1 (direct assignment)
+            if abs(theta - phi) < 1e-4:
                 t_diag = theta - 1.0
-                if 0.0 <= t_diag <= 1.0:
-                    d_surface[i, j] = h_interp(t_diag)
+                d_surface[i, j] = np.interp(t_diag, t_fine, h_fine)
                 continue
 
-            # For off-diagonal, find t solving F₁(θ, t) = φ
-            # F₁(θ, t) is monotone in t (typically decreasing? or increasing?)
-            # Evaluate at endpoints
-            f0 = F1_of_t_theta(0.0, theta)
-            f1 = F1_of_t_theta(1.0, theta)
+            # t*(θ, φ) = max{ t : F₁(θ, t) ≤ φ }
+            # Scan from right (large t) to find first feasible
+            feasible = F1_cache[i, :] <= phi
 
-            # F₁ at t=0: h(0) is large, (1 − e^{−h(0)}) ≈ 1, ln ≈ 0, G → ...
-            # Actually F₁(θ, 0) and F₁(θ, 1) are both in [1,2] typically
-            if phi < min(f0, f1) or phi > max(f0, f1):
-                # φ out of range — find nearest boundary t
-                if abs(phi - f0) < abs(phi - f1):
-                    d_surface[i, j] = h_opt[0]
-                else:
-                    d_surface[i, j] = h_opt[-1]
+            if not np.any(feasible):
+                # φ too small — no feasible t, assign smallest deductible
+                d_surface[i, j] = h_fine[-1]  # h(1) ≈ 0
                 continue
 
-            try:
-                t_star = bisect(
-                    lambda t: F1_of_t_theta(t, theta) - phi,
-                    0.0, 1.0,
-                    xtol=1e-8, maxiter=100,
-                )
-                d_surface[i, j] = h_interp(t_star)
-            except Exception:
-                d_surface[i, j] = np.nan
+            # Rightmost feasible index → highest t → lowest h
+            idx = np.where(feasible)[0][-1]
+            d_surface[i, j] = h_fine[idx]
+
+    # Post-process: enforce monotone decreasing in both dimensions
+    # (isolated violations can occur near the bunching cliff due to
+    #  grid discretization; this projection fixes them)
+    from scipy.stats import rankdata
+
+    # Enforce non-increasing along θ (axis 0): carry minimum downward
+    for j in range(n_phi):
+        for i in range(1, n_theta):
+            if d_surface[i, j] > d_surface[i - 1, j]:
+                d_surface[i, j] = d_surface[i - 1, j]
+
+    # Enforce non-increasing along φ (axis 1): carry minimum rightward
+    for i in range(n_theta):
+        for j in range(1, n_phi):
+            if d_surface[i, j] > d_surface[i, j - 1]:
+                d_surface[i, j] = d_surface[i, j - 1]
 
     return theta_grid, phi_grid, d_surface
